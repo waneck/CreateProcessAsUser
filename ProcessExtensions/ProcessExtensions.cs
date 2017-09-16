@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace murrayju.ProcessExtensions
@@ -12,12 +13,48 @@ namespace murrayju.ProcessExtensions
 
         private const int CREATE_NEW_CONSOLE = 0x00000010;
 
+        public const int HANDLE_FLAG_INHERIT = 0x00000001;
+
         private const uint INVALID_SESSION_ID = 0xFFFFFFFF;
         private static readonly IntPtr WTS_CURRENT_SERVER_HANDLE = IntPtr.Zero;
+
+        private static UInt32 INFINITE = 0xFFFFFFFF;
+
+        public const int STD_OUTPUT_HANDLE = -11;
+        public const int STD_ERROR_HANDLE = -12;
+
+        public const int PROCESS_STILL_ACTIVE = 259;
 
         #endregion
 
         #region DllImports
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern UInt32 WaitForSingleObject(IntPtr hHandle, UInt32 dwMilliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SECURITY_ATTRIBUTES
+        {
+            public int Length;
+            public IntPtr lpSecurityDescriptor;
+            public bool bInheritHandle;
+        }
+
+
+        [DllImport("kernel32", SetLastError = true)]
+        static extern bool ReadFile(IntPtr hFile, [Out] byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+        [DllImport("kernel32", SetLastError = true)]
+        static extern bool WriteFile(IntPtr hFile, [Out] byte[] lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr GetStdHandle(int nStdHandle);
 
         [DllImport("advapi32.dll", EntryPoint = "CreateProcessAsUser", SetLastError = true, CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
         private static extern bool CreateProcessAsUser(
@@ -58,6 +95,9 @@ namespace murrayju.ProcessExtensions
         [DllImport("Wtsapi32.dll")]
         private static extern uint WTSQueryUserToken(uint SessionId, ref IntPtr phToken);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetHandleInformation(IntPtr hObject, int dwMask, int dwFlags);
+
         [DllImport("wtsapi32.dll", SetLastError = true)]
         private static extern int WTSEnumerateSessions(
             IntPtr hServer,
@@ -65,6 +105,9 @@ namespace murrayju.ProcessExtensions
             int Version,
             ref IntPtr ppSessionInfo,
             ref int pCount);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CreatePipe(ref IntPtr hReadPipe, ref IntPtr hWritePipe, ref SECURITY_ATTRIBUTES lpPipeAttributes, int nSize);
 
         #endregion
 
@@ -207,8 +250,30 @@ namespace murrayju.ProcessExtensions
             return bResult;
         }
 
-        public static bool StartProcessAsCurrentUser(string appPath, string cmdLine = null, string workDir = null, bool visible = true)
+        public static uint StartProcessAsCurrentUser(string appPath, string cmdLine = null, string workDir = null, bool visible = true)
         {
+            SECURITY_ATTRIBUTES sa = new SECURITY_ATTRIBUTES();
+            sa.Length = Marshal.SizeOf(sa);
+            sa.bInheritHandle = true;
+
+            IntPtr hChildProcessOutputRd = new IntPtr();
+            IntPtr hChildProcessOutputWr = new IntPtr();
+            if (!CreatePipe(ref hChildProcessOutputRd, ref hChildProcessOutputWr, ref sa, 0))
+            {
+                CloseHandle(hChildProcessOutputRd);
+                CloseHandle(hChildProcessOutputWr);
+                Console.WriteLine("Failed to CreatePipe: {0}", Marshal.GetLastWin32Error());
+                throw new Exception("Failed to CreatePipe");
+            }
+
+            if (!SetHandleInformation(hChildProcessOutputRd, HANDLE_FLAG_INHERIT, 0))
+            {
+                CloseHandle(hChildProcessOutputRd);
+                CloseHandle(hChildProcessOutputWr);
+                Console.WriteLine("Failed to SetHandleInformation: {0}", Marshal.GetLastWin32Error());
+                throw new Exception("Failed to SetHandleInformation");
+            }
+
             var hUserToken = IntPtr.Zero;
             var startInfo = new STARTUPINFO();
             var procInfo = new PROCESS_INFORMATION();
@@ -216,6 +281,9 @@ namespace murrayju.ProcessExtensions
             int iResultOfCreateProcessAsUser;
 
             startInfo.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+            startInfo.hStdOutput = hChildProcessOutputWr;
+            startInfo.hStdError = hChildProcessOutputWr;
+            startInfo.dwFlags |= 0x00000100;
 
             try
             {
@@ -226,9 +294,12 @@ namespace murrayju.ProcessExtensions
 
                 uint dwCreationFlags = CREATE_UNICODE_ENVIRONMENT | (uint)(visible ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW);
                 startInfo.wShowWindow = (short)(visible ? SW.SW_SHOW : SW.SW_HIDE);
-                startInfo.lpDesktop = "winsta0\\default";
+                if (visible)
+                {
+                    startInfo.lpDesktop = "winsta0\\default";
+                }
 
-                if (!CreateEnvironmentBlock(ref pEnv, hUserToken, false))
+                if (!CreateEnvironmentBlock(ref pEnv, hUserToken, true))
                 {
                     throw new Exception("StartProcessAsCurrentUser: CreateEnvironmentBlock failed.");
                 }
@@ -238,7 +309,7 @@ namespace murrayju.ProcessExtensions
                     cmdLine, // Command Line
                     IntPtr.Zero,
                     IntPtr.Zero,
-                    false,
+                    true,
                     dwCreationFlags,
                     pEnv,
                     workDir, // Working directory
@@ -248,8 +319,39 @@ namespace murrayju.ProcessExtensions
                     iResultOfCreateProcessAsUser = Marshal.GetLastWin32Error();
                     throw new Exception("StartProcessAsCurrentUser: CreateProcessAsUser failed.  Error Code -" + iResultOfCreateProcessAsUser);
                 }
+                
+                //Get the handle to this process's console window
+                IntPtr hParentStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+
+                //Close this handle or the last ReadFile operation will hang
+                CloseHandle(hChildProcessOutputWr);
+                
+                const int bufSize = 1024;
+                var chBuf = new byte[bufSize];
+                uint exitCode;
+
+                while (true)
+                {
+                    
+
+                    //read output from child process
+                    uint dwRead;
+                    uint dwWritten;
+                    ReadFile(hChildProcessOutputRd, chBuf, bufSize, out dwRead, IntPtr.Zero);
+                    //write it out to this process's console
+                    WriteFile(hParentStdOut, chBuf, dwRead, out dwWritten, IntPtr.Zero);
+                    //Console.Write(System.Text.Encoding.Default.GetString(chBuf));
+
+                    //Must read the output while the process is running.  
+                    //Otherwise the buffer fills up and everything freezes
+                    GetExitCodeProcess(procInfo.hProcess, out exitCode);
+
+                    if (exitCode != PROCESS_STILL_ACTIVE)
+                        break;
+                }
 
                 iResultOfCreateProcessAsUser = Marshal.GetLastWin32Error();
+                return exitCode;
             }
             finally
             {
@@ -262,7 +364,7 @@ namespace murrayju.ProcessExtensions
                 CloseHandle(procInfo.hProcess);
             }
 
-            return true;
+            return 0xFFFFFF;
         }
 
     }
